@@ -1,0 +1,96 @@
+I want you to create a full implementation of a game in python with pygame.
+
+- It is a top down game.
+
+Characters (in general):
+- Characters are circles with square shoulders on the left and right side of the direction of the character that rotate so that they always tangent the inner circle.
+- The shoulder can be EXTENDED into longer rectangles aka. arms. These can rotate around the shoulder joint. They have the same color as the circle.
+    - Use the same square and extend it to a rectangle as an arm. The virtual hand is always at the end of the shoulder/arm.
+    - The extension is not immediate. There is an extension speed unique to certain equiments. 
+    - The arm angle is limited if the arm point straight out from the body, it can rotate 45 degrees back (at the direction of the character) and 135 degrees forward.
+    - When going from shoulder to arm, starting to extend. Alway initiate the angle pointing toward the cursor (as much as possible in relation to limits of course)
+- A character is always yellow.
+- Note that there is a hand. It is either under the shoulder when not extended or at the furthest length of the arm rectangle when the arm is extended.
+- There is a body and arm max rotation speed
+- it shouldn't be too fast paced so don't move the character too fast.
+- All charcters have 9 max hp for now.
+- There is no health regeneration
+
+Physics and Rendering layers:
+- from back to front:
+1. ground layer (for ground graphics)
+2. splatter layer (for fire, blood and other ground effects that you walk over)
+3. object layer (for things that collide such as characters and obstacles). 
+    a. Note that (apart from mentioned exceptions) everything in this layer will collide and not overlap. 
+    b. Make sure forces are applied and proper priority is done. 
+    c. Obstacles that don't move aka. locked objects never move and don't check collision against eachother.
+    d. use a physics library if feasible.
+    e. Characters don't collide with themselves or their own equipment. However, all their parts collide with other characters of course.
+4. roof layer (things here get transparent whenever they are in contact with a character object so you can see the character)
+
+Collision:
+- When characters collide with another character (body,arm or shoulder), they apply a small knockback effect on themselves to "take distance".
+- When a character takes damages it applies a larger knockback effect on itself to take more distance.
+
+Environment:
+- Fill the ground with cobblestone like circles in shades of grey.
+- Add some dark grey rock objects in the object layer
+- Add some brown round tree trunk objects with fooliage green circles in the roof layer.
+- Add 1 campfire in the ground layer that deals damage when standing in. This is a brown square with a red triangle with a smaller yellow triangle in, both that bob by extending the length of the triangle tip up and down.
+
+Equipment:
+- Items can be in each hand for characters. These items behave differently.
+- Sword: [Don't screw the placement up!] A grey rectangle pointing in the same direction as the arm, away from the arm! the hand is attached to the handle not the center.
+    + It points in the same direction as the character when the arm is not extended. 
+- Shield: Is a grey rectangle which is always tangenting the body of the character that wields it. It sits on the end of the hand.
+    + when a weapon hits the shield I want the sword to rotate backward like 90 degrees. the point is if you hit the shield it gives the opponent a window from your sword since the arm has a rotation speed. However make sure to animate this, it will feel weird if the arm just snaps back.
+- Dagger: shorter sword that extends faster but is shorter.
+- Bare-hand: if no item is equipped. There is a very fast extension. While extending (including the frame of full extension), if it hits a character. It applies a decent knockback and deals 1 damage.
+
+Player:
+- The player character moves with WASD
+- When holding no mouse button the player faces the cursor.
+- Pressing the left or right mouse button the body rotation will fixate and the corresponding right or left (or both) arm will extend and follow the cursor direction. It retracts when the button is released.
+
+Enemies:
+- Have a similar automatic behaviour.
+- Make the enemy circle the enemy or rock back and forth.
+- Swing toward the enemy when close. 
+- Enemies move and try to precisely avoid anything that can damage them such as a sword or a campfire.
+- Varied AI behaviour:
+    + Some always point their weapon toward you when close. 
+    + Some make occassional swings with their weapons and shields.
+    + Sometimes they circle the player and randomy decides to approach.
+    + Some will try to get as close as possible.
+    + Some will step back a forward testing the distance.
+    + Some (which is often) will try to circle you for a while before changing to attack mode.
+    + Please be creative with their behaviour! It should feel engaging and challenging.
+    + You might wanna make some kind of state machine and different profiles that randomly changes between behavioural states.
+
+Start Menu:
+- Provide some simple instructions for the game.
+- When clicking play you first get to choose your equipment for each hand.
+
+UI:
+- Show player health bar to the bottom left.
+- Show enemy health in the center of their body circle. The number of their current HP.
+
+Damage:
+- Anything sharp such as a sword or dagger deal 1 damage per tick.
+- When taking damage leave blood splatter relative to the damage dealt.
+
+Dying:
+- When the player dies create write a highscore based on the kills. Then press anykey to get to the start menu.
+
+Spawning:
+- Spawn enemies occassionally. Equip them randomly, however, never with two shield and never without a weapon.
+- Spawn them faster when there are fewer. 
+- Spawn them faster the longer the game time goes.
+- Spawn enemies from outside the screen
+- I want it to be generally one on one. But after a while if you don't kill one, another will come. Since they sometimes circle you, it will make it alot harder to play.
+
+work with classes as much as possible for inherited robust behaviours and avoiding code duplication.
+use callback functions for collision exception, triggers and so on.
+
+
+If things are unclear and doesn't make sense from a user perspective you are free to make adjustments or clarifications as you see fit.

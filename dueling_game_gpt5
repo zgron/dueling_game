@@ -1,0 +1,1196 @@
+import os
+import sys
+import math
+import random
+from collections import defaultdict, deque
+
+import pygame
+from pygame.math import Vector2 as V2
+
+# -------------------------
+# Config / Constants
+# -------------------------
+WIDTH, HEIGHT = 1280, 720
+FPS = 60
+
+YELLOW = (245, 221, 66)
+GREY = (120, 120, 120)
+DARK_GREY = (70, 70, 70)
+WHITE = (240, 240, 240)
+BLACK = (20, 20, 20)
+GREEN = (40, 140, 60)
+BROWN = (110, 70, 40)
+RED = (200, 30, 30)
+ORANGE = (240, 110, 20)
+HUD_GREEN = (52, 199, 89)
+
+# Gameplay tuning
+BODY_RADIUS = 22
+SHOULDER_SIZE = 16
+PLAYER_SPEED = 150  # px/sec
+ENEMY_SPEED = 130
+FRICTION = 8.0
+BODY_ROT_SPEED = math.radians(420)  # deg/s
+ARM_ROT_SPEED = math.radians(600)
+SMALL_COLLIDE_PUSH = 120.0  # impulse when bodies touch (self push away)
+HIT_KNOCKBACK = 220.0       # impulse when taking damage
+BLOCK_DEFLECT_DEG = 90      # sword deflect angle
+DAMAGE_TICK = 0.22          # seconds per damage tick vs same target
+PUNCH_COOLDOWN = 0.30       # per target
+
+# Arm angle limits: relative to shoulder’s radial “straight out”
+ARM_ANGLE_MIN = math.radians(-45)
+ARM_ANGLE_MAX = math.radians(135)
+
+# Spawn rules
+BASE_SPAWN_DELAY = 3.5
+MIN_SPAWN_DELAY = 0.9
+SPAWN_DECAY_PER_MIN = 0.5   # faster over time
+SPAWN_BOOST_WHEN_FEW = 1.0  # if few enemies, reduce delay
+
+HS_FILE = "highscore.txt"
+
+# -------------------------
+# Helpers
+# -------------------------
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def angle_to(vec):
+    return math.atan2(vec.y, vec.x)
+
+def ang_diff(a, b):
+    d = (b - a + math.pi) % (2*math.pi) - math.pi
+    return d
+
+def approach_angle(current, target, max_delta):
+    d = ang_diff(current, target)
+    if abs(d) <= max_delta:
+        return target
+    return current + max_delta * (1 if d > 0 else -1)
+
+def lerp(a, b, t): return a + (b-a)*t
+
+def rot(v, ang):
+    c, s = math.cos(ang), math.sin(ang)
+    return V2(v.x * c - v.y * s, v.x * s + v.y * c)
+
+def oriented_rect(center, angle, w, h):
+    # returns polygon points for an oriented rectangle
+    hw, hh = w/2, h/2
+    corners = [V2(-hw, -hh), V2(hw, -hh), V2(hw, hh), V2(-hw, hh)]
+    return [center + rot(p, angle) for p in corners]
+
+def point_to_segment_distance(p, a, b):
+    ab = b - a
+    t = 0.0 if ab.length_squared() == 0 else clamp((p - a).dot(ab) / ab.length_squared(), 0, 1)
+    closest = a + ab * t
+    return (p - closest).length(), closest
+
+def lines_intersect(p1, p2, p3, p4):
+    def ccw(a,b,c): return (c.y - a.y)*(b.x - a.x) > (b.y - a.y)*(c.x - a.x)
+    return (ccw(p1,p3,p4) != ccw(p2,p3,p4)) and (ccw(p1,p2,p3) != ccw(p1,p2,p4))
+
+def segment_polygon_intersect(a, b, poly_pts):
+    n = len(poly_pts)
+    for i in range(n):
+        c = poly_pts[i]
+        d = poly_pts[(i+1)%n]
+        if lines_intersect(a, b, c, d):
+            return True
+    # also handle if segment is completely inside polygon (point-in-poly)
+    if point_in_poly((a+b)/2, poly_pts):
+        return True
+    return False
+
+def point_in_poly(pt, poly):
+    x, y = pt.x, pt.y
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i].x, poly[i].y
+        xj, yj = poly[j].x, poly[j].y
+        intersect = ((yi > y) != (yj > y)) and (x < (xj-xi)*(y-yi)/(yj-yi + 1e-9) + xi)
+        if intersect:
+            inside = not inside
+        j = i
+    return inside
+
+def load_highscore():
+    try:
+        with open(HS_FILE, "r") as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+def save_highscore(score):
+    try:
+        with open(HS_FILE, "w") as f:
+            f.write(str(int(score)))
+    except:
+        pass
+
+# -------------------------
+# Splatter
+# -------------------------
+class SplatterLayer:
+    def __init__(self):
+        self.blood = []  # (pos, radius, color)
+    def add_blood(self, pos, amount=1):
+        for _ in range(random.randint(2, 3 + amount)):
+            r = random.randint(2, 5 + amount)
+            off = V2(random.uniform(-6, 6), random.uniform(-6, 6))
+            col = (150+random.randint(0,50), 0+random.randint(0,20), 0+random.randint(0,20))
+            self.blood.append((pos + off, r, col))
+    def draw(self, surf):
+        for pos, r, col in self.blood:
+            pygame.draw.circle(surf, col, pos, r)
+
+# -------------------------
+# Environment
+# -------------------------
+class Rock:
+    def __init__(self, pos, radius):
+        self.pos = V2(pos)
+        self.radius = radius
+    def draw(self, surf):
+        pygame.draw.circle(surf, DARK_GREY, self.pos, self.radius)
+        pygame.draw.circle(surf, (90,90,90), self.pos, int(self.radius*0.7), 2)
+
+class Tree:
+    # trunk collides; foliage is roof layer and becomes transparent when overlapping characters
+    def __init__(self, pos, trunk_r=16, foliage_r=44):
+        self.pos = V2(pos)
+        self.trunk_r = trunk_r
+        self.foliage_r = foliage_r
+    def draw_trunk(self, surf):
+        pygame.draw.circle(surf, BROWN, self.pos, self.trunk_r)
+    def draw_roof(self, surf, chars):
+        alpha = 210
+        for c in chars:
+            if (c.pos - self.pos).length() < (self.foliage_r + BODY_RADIUS*0.8):
+                alpha = 90
+                break
+        foliage = pygame.Surface((self.foliage_r*2+2, self.foliage_r*2+2), pygame.SRCALPHA)
+        pygame.draw.circle(foliage, (40, 140, 60, alpha), (self.foliage_r+1, self.foliage_r+1), self.foliage_r)
+        surf.blit(foliage, (self.pos.x - self.foliage_r -1, self.pos.y - self.foliage_r -1))
+
+class Campfire:
+    # damage area near center
+    def __init__(self, pos):
+        self.pos = V2(pos)
+        self.base_size = 20
+        self.timer = 0
+    def damage_circle(self):
+        return self.pos, 28
+    def update(self, dt):
+        self.timer += dt
+    def draw_ground(self, surf):
+        # wood square
+        size = self.base_size
+        rect = pygame.Rect(self.pos.x - size/2, self.pos.y - size/2, size, size)
+        pygame.draw.rect(surf, BROWN, rect)
+    def draw_splatter(self, surf):
+        # flames as bobbing triangles on splatter layer
+        t = math.sin(self.timer*6)*6 + 14
+        t2 = math.sin(self.timer*8+1.7)*4 + 10
+        # red
+        pts1 = [self.pos + V2(-10, 6), self.pos + V2(10, 6), self.pos + V2(0, -t)]
+        pygame.draw.polygon(surf, (210, 40, 30), pts1)
+        # yellow
+        pts2 = [self.pos + V2(-6, 6), self.pos + V2(6, 6), self.pos + V2(0, -t2)]
+        pygame.draw.polygon(surf, (240, 200, 20), pts2)
+
+# -------------------------
+# Items
+# -------------------------
+class Item:
+    name = "Item"
+    color = GREY
+    sharp = False
+    damage = 0
+    ext_speed = 260.0
+    max_len = 60.0
+    thickness = 8.0
+    def __init__(self): pass
+    def draw(self, surf, arm, base_color):
+        pass
+    def get_hit_segment(self, arm):
+        """Return (a,b, width) of blade if sharp; else None"""
+        return None
+    def get_block_polygon(self, arm):
+        """Return polygon points of shield-like block, else None"""
+        return None
+    def on_blocked(self, arm, by_shield):  # callback-style hook
+        pass
+
+class Sword(Item):
+    name="Sword"; sharp=True; damage=1; ext_speed=220.0; max_len=80.0; thickness=8.0
+    def draw(self, surf, arm, base_color):
+        # grey blade from hand outward
+        a, b, w = self.get_hit_segment(arm)
+        if a is None: return
+        # draw rectangle along segment
+        dirv = (b - a)
+        ang = angle_to(dirv)
+        length = dirv.length()
+        rect_pts = oriented_rect(a + dirv*0.5, ang, length, self.thickness)
+        pygame.draw.polygon(surf, (170,170,170), rect_pts)
+        # simple handle at hand (darker)
+        handle = oriented_rect(a, ang, 10, self.thickness+4)
+        pygame.draw.polygon(surf, (110,110,110), handle)
+    def get_hit_segment(self, arm):
+        if arm.ext <= 0.001: return (None, None, None)
+        hand = arm.hand_pos()
+        dirv = V2(math.cos(arm.world_angle()), math.sin(arm.world_angle()))
+        blade_len = arm.ext
+        a = hand
+        b = hand + dirv * blade_len
+        return (a, b, self.thickness)
+    def on_blocked(self, arm, by_shield):
+        # apply a temporary angular kickback ~90 deg backward from swing
+        sign = -1 if arm.side > 0 else 1  # backward relative to outward?
+        arm.kickback_target = math.radians(BLOCK_DEFLECT_DEG) * sign
+        arm.kickback_vel = math.radians(900)
+        arm.kickback_active = True
+
+class Dagger(Sword):
+    name="Dagger"; ext_speed=360.0; max_len=48.0; thickness=7.0
+
+class Shield(Item):
+    name="Shield"; sharp=False; damage=0; ext_speed=180.0; max_len=50.0; thickness=14.0
+    def draw(self, surf, arm, base_color):
+        poly = self.get_block_polygon(arm)
+        if poly:
+            pygame.draw.polygon(surf, (150,150,150), poly)
+            pygame.draw.polygon(surf, (100,100,100), poly, 2)
+    def get_block_polygon(self, arm):
+        # Tangent to body; sits at hand, oriented tangent to body
+        # Tangent direction is +/- 90° from body forward
+        tangent_ang = arm.owner.body_angle + (math.pi/2 if arm.side < 0 else -math.pi/2)
+        center = arm.hand_pos()
+        w = self.thickness * 1.2
+        h = SHOULDER_SIZE + 10
+        return oriented_rect(center, tangent_ang, w, h)
+
+class BareHand(Item):
+    name="Bare"; sharp=False; damage=1; ext_speed=520.0; max_len=42.0; thickness=SHOULDER_SIZE
+    def draw(self, surf, arm, base_color):
+        # Just the arm rectangle; the hand is implicit
+        pass
+
+# -------------------------
+# Arms
+# -------------------------
+class Arm:
+    def __init__(self, owner, side, item):
+        self.owner = owner
+        self.side = side  # -1 left, +1 right (relative to facing)
+        self.item = item
+
+        self.ext = 0.0
+        self.target_active = False
+        self.prev_active = False
+
+        # Angle relative to shoulder outward
+        self.rel_angle = 0.0
+        self.target_rel_angle = 0.0
+
+        # Kickback deflection
+        self.kickback_active = False
+        self.kickback_target = 0.0
+        self.kickback_current = 0.0
+        self.kickback_vel = 0.0
+
+        # Damage cooldowns per target id
+        self.damage_cds = defaultdict(float)
+        self.punch_hits = set()  # track targets already punched this extension
+
+    def base_outward_angle(self):
+        # Outward = perpendicular to body facing
+        return self.owner.body_angle + (math.pi/2 if self.side < 0 else -math.pi/2)
+
+    def world_angle(self):
+        return self.base_outward_angle() + self.rel_angle + self.kickback_current
+
+    def shoulder_pos(self):
+        outward = V2(math.cos(self.base_outward_angle()), math.sin(self.base_outward_angle()))
+        return self.owner.pos + outward * (BODY_RADIUS + SHOULDER_SIZE/2)
+
+    def hand_pos(self):
+        # hand is at end of shoulder/arm
+        angle = self.world_angle()
+        dirv = V2(math.cos(angle), math.sin(angle))
+        return self.shoulder_pos() + dirv * max(self.ext, SHOULDER_SIZE/2)
+
+    def update(self, dt, aim_point=None, active=None):
+        # activation (from input or AI)
+        self.prev_active = self.target_active
+        if active is not None:
+            self.target_active = active
+
+        # decide angle target
+        if aim_point is not None:
+            # compute relative angle to aim
+            base = self.base_outward_angle()
+            to_cursor = angle_to(aim_point - self.shoulder_pos())
+            rel = ang_diff(base, to_cursor)
+            rel = clamp(rel, ARM_ANGLE_MIN, ARM_ANGLE_MAX)
+            self.target_rel_angle = rel
+
+        # when starting to extend, snap current rel angle toward target (initiate angle)
+        if self.target_active and not self.prev_active:
+            self.rel_angle = self.target_rel_angle
+            self.kickback_current = 0.0  # reset kickback on new swing
+            self.kickback_active = False
+            self.punch_hits.clear()
+
+        # rotate arm toward target with limit
+        self.rel_angle = approach_angle(self.rel_angle, self.target_rel_angle, ARM_ROT_SPEED * dt)
+        self.rel_angle = clamp(self.rel_angle, ARM_ANGLE_MIN, ARM_ANGLE_MAX)
+
+        # extension/retraction
+        speed = self.item.ext_speed
+        if self.target_active:
+            self.ext = clamp(self.ext + speed*dt, 0.0, self.item.max_len)
+        else:
+            self.ext = clamp(self.ext - speed*dt, 0.0, self.item.max_len)
+
+        # Animate kickback if active
+        if self.kickback_active:
+            # approach towards kickback_target then decay back to 0
+            self.kickback_current = approach_angle(self.kickback_current, self.kickback_target, self.kickback_vel*dt)
+            # when reached target, go back
+            if abs(ang_diff(self.kickback_current, self.kickback_target)) < math.radians(3):
+                self.kickback_target = 0.0
+                self.kickback_vel = math.radians(600)
+                if abs(self.kickback_current) < math.radians(2):
+                    self.kickback_current = 0.0
+                    self.kickback_active = False
+
+        # cooldown decay
+        for k in list(self.damage_cds.keys()):
+            self.damage_cds[k] = max(0.0, self.damage_cds[k] - dt)
+            if self.damage_cds[k] <= 0:
+                del self.damage_cds[k]
+
+    def draw(self, surf):
+        # Shoulder square (rotated to be tangent to body)
+        shoulder_center = self.shoulder_pos()
+        # Orient square so a face points to center (i.e. normal = -outward)
+        outward_ang = self.base_outward_angle()
+        # Align a side tangent by rotating square by outward_ang
+        pts = oriented_rect(shoulder_center, outward_ang, SHOULDER_SIZE, SHOULDER_SIZE)
+        pygame.draw.polygon(surf, YELLOW, pts)
+
+        # Arm rectangle if extended beyond square half
+        if self.ext > SHOULDER_SIZE/2 + 0.1:
+            angle = self.world_angle()
+            length = self.ext
+            rect_pts = oriented_rect(shoulder_center + V2(math.cos(angle), math.sin(angle))* (length/2),
+                                     angle, length, SHOULDER_SIZE)
+            pygame.draw.polygon(surf, YELLOW, rect_pts)
+
+    # collision/damage hooks
+    def try_attack(self, game, others):
+        owner = self.owner
+
+        # shield block polygon (defender)
+        # attacker shapes
+        if isinstance(self.item, Sword) or isinstance(self.item, Dagger):
+            seg = self.item.get_hit_segment(self)
+            if seg[0] is None:
+                return
+            a, b, w = seg
+            for target in others:
+                if target is owner or target.dead: continue
+                # if intersects shield first => block
+                blocked = False
+                for arm in target.arms:
+                    poly = None
+                    if isinstance(arm.item, Shield):
+                        poly = arm.item.get_block_polygon(arm)
+                    if poly and segment_polygon_intersect(a, b, poly):
+                        blocked = True
+                        self.item.on_blocked(self, arm.item)
+                        # apply a tiny stagger to attacker velocity
+                        owner.vel -= (b - a).normalize() * 40
+                        break
+                if blocked:
+                    continue
+
+                # hit body?
+                dist, point = point_to_segment_distance(target.pos, a, b)
+                if dist <= target.radius + w*0.35:
+                    key = id(target)
+                    if self.damage_cds.get(key, 0) <= 0:
+                        target.take_damage(game, self.item.damage, (point - owner.pos))
+                        self.damage_cds[key] = DAMAGE_TICK
+        elif isinstance(self.item, BareHand):
+            # only during extending (including first full extension frame)
+            if not self.prev_active and self.target_active:
+                extending = True
+            else:
+                # check if ext increased this frame
+                extending = self.target_active and self.ext > SHOULDER_SIZE/2 + 0.1
+            if not extending: return
+            # The punch is considered active during extension; hit once per target per extension
+            hand = self.hand_pos()
+            for target in others:
+                if target is owner or target.dead: continue
+                if target in self.punch_hits: continue
+                if (target.pos - hand).length() <= target.radius + SHOULDER_SIZE*0.35:
+                    target.take_damage(game, 1, (target.pos - self.shoulder_pos()))
+                    self.punch_hits.add(target)
+
+# -------------------------
+# Character
+# -------------------------
+class Character:
+    def __init__(self, pos, is_player=False):
+        self.pos = V2(pos)
+        self.vel = V2(0,0)
+        self.radius = BODY_RADIUS
+        self.body_angle = 0.0
+
+        self.max_hp = 9
+        self.hp = self.max_hp
+        self.dead = False
+        self.is_player = is_player
+        self.kills = 0
+
+        self.body_rot_speed = BODY_ROT_SPEED
+        self.speed = PLAYER_SPEED if is_player else ENEMY_SPEED
+
+        # items (can change in loadout)
+        self.left_item = BareHand()
+        self.right_item = Sword()
+        self.arms = [
+            Arm(self, side=-1, item=self.left_item),
+            Arm(self, side=+1, item=self.right_item)
+        ]
+
+        # control state
+        self.body_locked = False  # lock rotation while attacking
+
+        # ai brain (for enemies)
+        self.brain = None
+
+    def set_loadout(self, left, right):
+        self.left_item = left
+        self.right_item = right
+        self.arms = [
+            Arm(self, side=-1, item=self.left_item),
+            Arm(self, side=+1, item=self.right_item)
+        ]
+
+    def update(self, game, dt):
+        if self.dead: return
+
+        if self.is_player:
+            self.update_player(game, dt)
+        else:
+            self.update_enemy(game, dt)
+
+        # movement integration
+        self.pos += self.vel * dt
+        # friction
+        if self.vel.length_squared() > 0:
+            decel = FRICTION * dt
+            spd = self.vel.length()
+            if spd <= decel:
+                self.vel = V2(0,0)
+            else:
+                self.vel.scale_to_length(spd - decel)
+
+        # collisions vs obstacles (locked objects never move; separate self)
+        for rock in game.rocks + [t for t in game.trees]:  # trunks collide
+            rpos = rock.pos
+            rr = rock.radius if isinstance(rock, Rock) else rock.trunk_r
+            to_me = self.pos - rpos
+            dist = to_me.length()
+            overlap = self.radius + rr - dist
+            if overlap > 0 and dist > 1e-3:
+                n = to_me / dist
+                self.pos += n * overlap
+                # push self a bit away (feel of taking distance)
+                self.vel += n * SMALL_COLLIDE_PUSH * dt
+
+        # body vs body
+        for other in game.characters:
+            if other is self or other.dead: continue
+            to_me = self.pos - other.pos
+            dist = to_me.length()
+            overlap = self.radius + other.radius - dist
+            if overlap > 0 and dist > 1e-3:
+                n = to_me / dist
+                # separate evenly (but obstacles rule says only objects layer collides; both are characters => separate)
+                self.pos += n * (overlap*0.5)
+                other.pos -= n * (overlap*0.5)
+                # small knockback self
+                self.vel += n * SMALL_COLLIDE_PUSH * dt
+
+        # campfire damage + avoidance handled elsewhere; here apply damage if overlapping
+        for cf in game.campfires:
+            cpos, cr = cf.damage_circle()
+            if (self.pos - cpos).length() <= cr + self.radius*0.2:
+                # damage over time: integer tick
+                self._tick_damage_timer = getattr(self, "_tick_damage_timer", 0.0)
+                self._tick_damage_timer -= dt
+                if self._tick_damage_timer <= 0:
+                    self.take_damage(game, 1, self.pos - cpos)
+                    self._tick_damage_timer = 0.5
+
+        # arms act (damage checks vs others)
+        others = [c for c in game.characters if c is not self]
+        for arm in self.arms:
+            arm.try_attack(game, others)
+
+        if self.hp <= 0 and not self.dead:
+            self.dead = True
+            if self.is_player:
+                game.on_player_die()
+
+    def face_toward(self, target_pos, dt):
+        target_ang = angle_to(target_pos - self.pos)
+        self.body_angle = approach_angle(self.body_angle, target_ang, self.body_rot_speed * dt)
+
+    def update_player(self, game, dt):
+        keys = pygame.key.get_pressed()
+        move = V2(0,0)
+        if keys[pygame.K_w]: move.y -= 1
+        if keys[pygame.K_s]: move.y += 1
+        if keys[pygame.K_a]: move.x -= 1
+        if keys[pygame.K_d]: move.x += 1
+        if move.length_squared() > 0:
+            move = move.normalize()
+        self.vel += move * self.speed * dt * 4.0  # accel
+
+        mpos = V2(pygame.mouse.get_pos())
+        lmb = pygame.mouse.get_pressed(3)[0]
+        rmb = pygame.mouse.get_pressed(3)[2]
+
+        self.body_locked = lmb or rmb
+
+        if not self.body_locked:
+            self.face_toward(mpos, dt)
+
+        # arms
+        self.arms[0].update(dt, aim_point=mpos, active=lmb)  # left
+        self.arms[1].update(dt, aim_point=mpos, active=rmb)  # right
+
+    def update_enemy(self, game, dt):
+        if self.brain is None:
+            self.brain = EnemyBrain(self)
+        self.brain.update(game, dt)
+
+    def take_damage(self, game, dmg, direction_vec):
+        if self.dead: return
+        self.hp -= int(dmg)
+        # blood
+        game.splatter.add_blood(self.pos, amount=dmg)
+        # knockback self
+        dirn = direction_vec
+        if dirn.length_squared() > 0:
+            dirn = dirn.normalize()
+            self.vel += dirn * HIT_KNOCKBACK
+        # on death scoring
+        if self.hp <= 0:
+            self.hp = 0
+            if isinstance(self, Enemy):
+                game.player.kills += 1
+
+    def draw(self, surf, game=None):
+        # body
+        pygame.draw.circle(surf, YELLOW, self.pos, self.radius)
+        # facing indicator
+        nose = self.pos + V2(math.cos(self.body_angle), math.sin(self.body_angle))* (self.radius+6)
+        pygame.draw.line(surf, (80,80,20), self.pos, nose, 3)
+
+        # arms first (under equipment)
+        for arm in self.arms:
+            arm.draw(surf)
+
+        # items on top of arms as needed
+        for arm in self.arms:
+            arm.item.draw(surf, arm, YELLOW)
+
+        # UI: enemy HP number centered
+        if not self.is_player:
+            # use provided game font if available; else create a temporary font
+            if game and hasattr(game, 'small_font'):
+                font = game.small_font
+            else:
+                font = pygame.font.SysFont("consolas", 14)
+            txt = font.render(str(self.hp), True, BLACK)
+            r = txt.get_rect(center=(int(self.pos.x), int(self.pos.y)))
+            surf.blit(txt, r)
+
+class Enemy(Character):
+    pass
+
+# -------------------------
+# Enemy Brain
+# -------------------------
+class EnemyBrain:
+    STATES = ("CIRCLE", "APPROACH", "ATTACK", "RETREAT", "TEST", "HOLD")
+    def __init__(self, owner):
+        self.o = owner
+        self.state = "CIRCLE"
+        self.timer = 0.0
+        # behavior profile (randomized)
+        self.profile = {
+            "circle_time": random.uniform(1.2, 2.8),
+            "approach_time": random.uniform(0.8, 1.5),
+            "retreat_time": random.uniform(0.6, 1.0),
+            "hold_time": random.uniform(0.4, 1.2),
+            "test_time": random.uniform(0.5, 1.1),
+            "circle_dir": random.choice([-1, 1]),
+            "aggro_range": random.uniform(120, 180),
+            "attack_range": random.uniform(65, 95),
+            "prefer_front": random.random() < 0.5,
+            "always_point_close": random.random() < 0.5,
+        }
+        # choose attacking arm prioritizing weaponed hand
+        self.prefer_right = isinstance(self.o.right_item, (Sword, Dagger))
+        self.prefer_left = isinstance(self.o.left_item, (Sword, Dagger))
+        if self.prefer_left and not self.prefer_right:
+            self.attack_side = -1
+        elif self.prefer_right and not self.prefer_left:
+            self.attack_side = +1
+        else:
+            self.attack_side = random.choice([-1, +1])
+
+    def hazards_repulsion(self, game):
+        # simple avoidance from campfire and active swords pointed at us
+        rep = V2(0,0)
+        for cf in game.campfires:
+            cpos, cr = cf.damage_circle()
+            d = (self.o.pos - cpos)
+            L = d.length()
+            if L < cr + 70 and L > 1:
+                rep += d.normalize() * (1.2 - (L / (cr+70))) * 300
+        # avoid enemy swords
+        for ch in game.characters:
+            if ch is self.o or ch.dead: continue
+            for arm in ch.arms:
+                if isinstance(arm.item, (Sword, Dagger)) and arm.ext > SHOULDER_SIZE:
+                    a,b,_ = arm.item.get_hit_segment(arm)
+                    if a is None: continue
+                    dist, closest = point_to_segment_distance(self.o.pos, a, b)
+                    if dist < self.o.radius + 50:
+                        d = (self.o.pos - closest)
+                        if d.length() > 1:
+                            rep += d.normalize() * (1.0 - dist/(self.o.radius+50)) * 280
+        return rep
+
+    def update(self, game, dt):
+        target = game.player
+        if target.dead:
+            # idle circle some rock
+            tgt_pos = random.choice(game.rocks).pos if game.rocks else target.pos
+        else:
+            tgt_pos = target.pos
+
+        self.timer -= dt
+        desired_vel = V2(0,0)
+
+        # state transitions
+        dist = (tgt_pos - self.o.pos).length()
+        if self.state == "CIRCLE":
+            # orbit target
+            to_tgt = (tgt_pos - self.o.pos)
+            tang = rot(to_tgt, math.pi/2 * self.profile["circle_dir"])
+            if tang.length() > 0:
+                tang = tang.normalize()
+            desired_vel += tang * self.o.speed
+            # maintain soft distance
+            if dist < self.profile["aggro_range"]*0.8:
+                desired_vel -= to_tgt.normalize() * (self.o.speed*0.6)
+            else:
+                desired_vel += to_tgt.normalize() * (self.o.speed*0.3)
+            if self.timer <= 0:
+                self.timer = self.profile["approach_time"]
+                self.state = "APPROACH"
+        elif self.state == "APPROACH":
+            desired_vel += (tgt_pos - self.o.pos).normalize() * self.o.speed
+            if dist < self.profile["attack_range"]:
+                self.state = "ATTACK"; self.timer = random.uniform(0.3, 0.7)
+            elif self.timer <= 0:
+                self.state = "HOLD"; self.timer = self.profile["hold_time"]
+        elif self.state == "ATTACK":
+            # stop to swing, maybe micro step
+            desired_vel *= 0
+            # choose arm; point toward player
+            aim = target.pos
+            left = self.o.arms[0]; right = self.o.arms[1]
+            l_active = (self.attack_side == -1)
+            r_active = (self.attack_side == +1)
+            left.update(dt, aim_point=aim, active=l_active)
+            right.update(dt, aim_point=aim, active=r_active)
+            if self.timer <= 0 or dist > self.profile["attack_range"]*1.3:
+                # alternate side sometimes
+                if random.random() < 0.35:
+                    self.attack_side *= -1
+                self.state = "RETREAT"; self.timer = self.profile["retreat_time"]
+        elif self.state == "RETREAT":
+            if dist > self.profile["aggro_range"]*0.9:
+                self.state = "CIRCLE"; self.timer = self.profile["circle_time"]
+            else:
+                desired_vel += (self.o.pos - tgt_pos).normalize() * self.o.speed
+                if self.timer <= 0:
+                    self.state = "TEST"; self.timer = self.profile["test_time"]
+        elif self.state == "TEST":
+            # step in and out testing distance
+            dirn = (tgt_pos - self.o.pos).normalize() if dist>1 else V2(1,0)
+            step = 1 if (self.timer*3)%1>0.5 else -1
+            desired_vel += dirn * (self.o.speed*0.6*step)
+            if self.timer <= 0:
+                self.state = "CIRCLE"; self.timer = self.profile["circle_time"]
+        elif self.state == "HOLD":
+            # keep distance, face target, maybe shield up (auto)
+            desired_vel *= 0
+            if self.timer <= 0:
+                self.state = "CIRCLE"; self.timer = self.profile["circle_time"]
+
+        # keep aiming arm(s)
+        if self.state != "ATTACK":
+            # retract unless super close and opportunistic
+            left = self.o.arms[0]
+            right = self.o.arms[1]
+            aim = tgt_pos
+            l_active = False
+            r_active = False
+            # sometimes keep pointing weapon toward you
+            if self.profile["always_point_close"] and dist < self.profile["aggro_range"]:
+                if isinstance(left.item,(Sword,Dagger,Shield)):
+                    left.update(dt, aim_point=aim, active=False)
+                if isinstance(right.item,(Sword,Dagger,Shield)):
+                    right.update(dt, aim_point=aim, active=False)
+            else:
+                left.update(dt, aim_point=aim, active=l_active)
+                right.update(dt, aim_point=aim, active=r_active)
+
+        # hazard avoidance
+        rep = self.hazards_repulsion(game)
+        desired_vel += rep
+
+        # lock body rotation if currently attacking (either arm active)
+        self.o.body_locked = any(a.target_active for a in self.o.arms)
+        if not self.o.body_locked:
+            self.o.face_toward(tgt_pos, dt)
+
+        # normal arm updates if not already updated above
+        if self.state not in ("ATTACK",):
+            for arm in self.o.arms:
+                if arm not in (getattr(self, "updated_arm1", None), getattr(self, "updated_arm2", None)):
+                    arm.update(dt)
+
+        # apply velocity (smooth accel)
+        if desired_vel.length_squared() > 0:
+            desired = desired_vel
+            max_add = self.o.speed * 3.5 * dt
+            add = desired.normalize() * max_add
+            self.o.vel += add
+
+# -------------------------
+# World / Game
+# -------------------------
+class Game:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        pygame.display.set_caption("Top-Down Arms")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("consolas", 20)
+        self.big_font = pygame.font.SysFont("consolas", 44, bold=True)
+        self.small_font = pygame.font.SysFont("consolas", 14)
+
+        # layers and entities
+        self.splatter = SplatterLayer()
+        self.rocks = []
+        self.trees = []
+        self.campfires = []
+
+        self.characters = []
+        self.player = None
+
+        self.running = True
+        self.state = "MENU"  # MENU -> EQUIP -> PLAY -> GAMEOVER
+        self.elapsed = 0.0
+
+        # spawn control
+        self.spawn_timer = 2.5
+        self.total_time = 0.0
+
+        # ground pre-render
+        self.ground = pygame.Surface((WIDTH, HEIGHT))
+        self.draw_ground(self.ground)
+
+        self.make_environment()
+
+        # menu selections
+        self.equip_left_idx = 0
+        self.equip_right_idx = 1
+        self.equip_options = [BareHand, Sword, Dagger, Shield]
+
+        self.highscore = load_highscore()
+
+    # -------------------------
+    # Setup
+    # -------------------------
+    def draw_ground(self, surf):
+        surf.fill((95, 95, 95))
+        random.seed(1)
+        # cobblestone circles
+        for _ in range(800):
+            r = random.randint(4, 10)
+            col = random.randint(110, 160)
+            c = (col, col, col)
+            x = random.randint(-50, WIDTH+50)
+            y = random.randint(-50, HEIGHT+50)
+            pygame.draw.circle(surf, c, (x,y), r)
+        # subtle noise
+        for _ in range(500):
+            x = random.randint(0, WIDTH-1)
+            y = random.randint(0, HEIGHT-1)
+            self.ground.set_at((x,y), (80,80,80))
+
+    def make_environment(self):
+        random.seed()
+        # rocks
+        for _ in range(7):
+            x = random.randint(80, WIDTH-80)
+            y = random.randint(80, HEIGHT-80)
+            r = random.randint(18, 30)
+            self.rocks.append(Rock((x,y), r))
+        # trees
+        for _ in range(6):
+            x = random.randint(80, WIDTH-80)
+            y = random.randint(80, HEIGHT-80)
+            self.trees.append(Tree((x,y), trunk_r=random.randint(14,19), foliage_r=random.randint(38,56)))
+        # campfire
+        self.campfires.append(Campfire((WIDTH//2, HEIGHT//2 + 120)))
+
+    # -------------------------
+    # State control
+    # -------------------------
+    def new_game(self):
+        self.characters.clear()
+        self.splatter = SplatterLayer()
+        self.elapsed = 0.0
+        self.total_time = 0.0
+        self.spawn_timer = 1.8
+
+        self.player = Character((WIDTH/2, HEIGHT/2), is_player=True)
+        # apply equipment
+        L = self.equip_options[self.equip_left_idx]()
+        R = self.equip_options[self.equip_right_idx]()
+        # disallow double shield (enforced in UI too)
+        if isinstance(L, Shield) and isinstance(R, Shield):
+            R = Sword()
+        # disallow no weapon (at least one non-bare)
+        if isinstance(L, BareHand) and isinstance(R, BareHand):
+            R = Sword()
+        self.player.set_loadout(L, R)
+
+        self.characters = [self.player]
+        # spawn one enemy immediately
+        self.spawn_enemy()
+
+    def spawn_enemy(self):
+        # spawn from outside screen edges
+        margin = 60
+        side = random.choice(["left","right","top","bottom"])
+        if side == "left":
+            pos = V2(-margin, random.uniform(0, HEIGHT))
+        elif side == "right":
+            pos = V2(WIDTH+margin, random.uniform(0, HEIGHT))
+        elif side == "top":
+            pos = V2(random.uniform(0, WIDTH), -margin)
+        else:
+            pos = V2(random.uniform(0, WIDTH), HEIGHT+margin)
+        e = Enemy(pos)
+        # random gear: never two shields, never both bare, at least one weapon
+        choices = [BareHand, Sword, Dagger, Shield]
+        left_cls = random.choice(choices)
+        right_cls = random.choice(choices)
+        # enforce rules
+        if left_cls == Shield and right_cls == Shield:
+            right_cls = random.choice([Sword, Dagger])
+        if left_cls == BareHand and right_cls == BareHand:
+            right_cls = random.choice([Sword, Dagger, Shield])
+        # never without a weapon (at least sword/dagger)
+        if not (left_cls in (Sword, Dagger) or right_cls in (Sword, Dagger)):
+            if random.random()<0.5:
+                left_cls = random.choice([Sword, Dagger])
+            else:
+                right_cls = random.choice([Sword, Dagger])
+        e.set_loadout(left_cls(), right_cls())
+        # give some variety on speed/rot
+        e.speed = ENEMY_SPEED * random.uniform(0.9, 1.1)
+        e.body_rot_speed = BODY_ROT_SPEED * random.uniform(0.8, 1.1)
+        self.characters.append(e)
+
+    def on_player_die(self):
+        # write highscore based on kills
+        if self.player:
+            if self.player.kills > self.highscore:
+                self.highscore = self.player.kills
+                save_highscore(self.highscore)
+        self.state = "GAMEOVER"
+
+    # -------------------------
+    # Main Loop
+    # -------------------------
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000.0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                if self.state == "MENU":
+                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        mx,my = event.pos
+                        if self.button_rect.collidepoint(mx,my):
+                            self.state = "EQUIP"
+                elif self.state == "EQUIP":
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_a, pygame.K_LEFT):
+                            self.equip_left_idx = (self.equip_left_idx - 1) % len(self.equip_options)
+                            # prevent double shield visual config
+                            if (self.equip_options[self.equip_left_idx] == Shield and
+                                self.equip_options[self.equip_right_idx] == Shield):
+                                self.equip_right_idx = (self.equip_right_idx + 1) % len(self.equip_options)
+                        if event.key in (pygame.K_d, pygame.K_RIGHT):
+                            self.equip_left_idx = (self.equip_left_idx + 1) % len(self.equip_options)
+                            if (self.equip_options[self.equip_left_idx] == Shield and
+                                self.equip_options[self.equip_right_idx] == Shield):
+                                self.equip_right_idx = (self.equip_right_idx + 1) % len(self.equip_options)
+                        if event.key in (pygame.K_q,):
+                            self.equip_right_idx = (self.equip_right_idx - 1) % len(self.equip_options)
+                            if (self.equip_options[self.equip_left_idx] == Shield and
+                                self.equip_options[self.equip_right_idx] == Shield):
+                                self.equip_left_idx = (self.equip_left_idx + 1) % len(self.equip_options)
+                        if event.key in (pygame.K_e,):
+                            self.equip_right_idx = (self.equip_right_idx + 1) % len(self.equip_options)
+                            if (self.equip_options[self.equip_left_idx] == Shield and
+                                self.equip_options[self.equip_right_idx] == Shield):
+                                self.equip_left_idx = (self.equip_left_idx + 1) % len(self.equip_options)
+                        if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            self.state = "PLAY"
+                            self.new_game()
+                    if event.type == pygame.MOUSEBUTTONDOWN and event.button==1:
+                        mx,my = event.pos
+                        if self.play_rect.collidepoint(mx,my):
+                            self.state = "PLAY"
+                            self.new_game()
+                elif self.state == "GAMEOVER":
+                    if event.type == pygame.KEYDOWN or (event.type==pygame.MOUSEBUTTONDOWN and event.button==1):
+                        self.state = "MENU"
+
+            if self.state == "MENU":
+                self.draw_menu()
+            elif self.state == "EQUIP":
+                self.draw_equip()
+            elif self.state == "PLAY":
+                self.update_play(dt)
+                self.draw_play()
+            elif self.state == "GAMEOVER":
+                self.draw_gameover()
+
+        pygame.quit()
+
+    # -------------------------
+    # Play update/draw
+    # -------------------------
+    def update_play(self, dt):
+        self.elapsed += dt
+        self.total_time += dt
+        for cf in self.campfires: cf.update(dt)
+
+        # characters
+        for ch in self.characters:
+            ch.update(self, dt)
+
+        # cull dead enemies
+        # cull dead enemies (remove only dead enemy instances)
+        self.characters = [c for c in self.characters if not (isinstance(c, Enemy) and c.dead and (c.hp<=0))]
+
+
+        # spawn logic: faster if fewer and over time
+        enemies = [c for c in self.characters if isinstance(c, Enemy) and not c.dead]
+        curr_delay = BASE_SPAWN_DELAY
+        curr_delay -= min(2.0, (self.total_time/60.0)*SPAWN_DECAY_PER_MIN)
+        if len(enemies) <= 0:
+            curr_delay -= SPAWN_BOOST_WHEN_FEW
+        curr_delay = max(MIN_SPAWN_DELAY, curr_delay)
+
+        # generally one-on-one but if you stall, another comes
+        target_count = 1
+        if self.elapsed > 20: target_count = 2
+        if self.elapsed > 60: target_count = 3
+
+        self.spawn_timer -= dt
+        if self.spawn_timer <= 0 and len(enemies) < target_count:
+            self.spawn_enemy()
+            self.spawn_timer = curr_delay
+
+    def draw_play(self):
+        # 1. ground
+        self.screen.blit(self.ground, (0,0))
+        for cf in self.campfires: cf.draw_ground(self.screen)
+
+        # 2. splatter (blood, fire flames)
+        self.splatter.draw(self.screen)
+        for cf in self.campfires: cf.draw_splatter(self.screen)
+
+        # 3. objects (characters, rocks, trunks)
+        for r in self.rocks: r.draw(self.screen)
+        for t in self.trees: t.draw_trunk(self.screen)
+
+        # characters
+        for c in self.characters:
+            if not isinstance(c, Enemy):  # draw enemies after player so enemies can overlap too
+                pass
+        # simple: draw by y for mild depth
+        for c in sorted(self.characters, key=lambda x: x.pos.y):
+            # pass the Game instance so enemies can draw their HP using its fonts
+            c.draw(self.screen, self)
+
+        # 4. roof (foliage)
+        for t in self.trees:
+            t.draw_roof(self.screen, [c for c in self.characters if not c.dead])
+
+        # UI
+        self.draw_hud()
+
+        pygame.display.flip()
+
+    def draw_hud(self):
+        # player health bar bottom-left
+        p = self.player
+        if p:
+            x, y = 20, HEIGHT - 24
+            w, h = 180, 14
+            pygame.draw.rect(self.screen, (60,60,60), (x-2,y-2,w+4,h+4))
+            pygame.draw.rect(self.screen, (30,30,30), (x,y,w,h))
+            ratio = p.hp / p.max_hp
+            pygame.draw.rect(self.screen, HUD_GREEN, (x, y, int(w*ratio), h))
+            txt = self.font.render(f"HP {p.hp}/{p.max_hp}", True, WHITE)
+            self.screen.blit(txt, (x+4, y-22))
+
+            ktxt = self.font.render(f"Kills: {p.kills}", True, WHITE)
+            self.screen.blit(ktxt, (x+4, y-44))
+
+    # -------------------------
+    # Menu / Equip / Game Over
+    # -------------------------
+    def draw_menu(self):
+        self.screen.fill((30,30,35))
+        title = self.big_font.render("Top-Down Arms", True, WHITE)
+        trect = title.get_rect(center=(WIDTH//2, HEIGHT//2 - 120))
+        self.screen.blit(title, trect)
+
+        inst_lines = [
+            "WASD to move. Aim with mouse.",
+            "No mouse buttons: body faces cursor.",
+            "Hold Left/Right mouse: lock body and extend left/right arm toward cursor.",
+            "Sword/Dagger: deal damage on contact; Shield blocks & deflects opponent swords.",
+            "Bare hand: fast jab — deals 1 dmg & knockback only while extending.",
+            "Campfire hurts; Enemies try to avoid it.",
+            "Enemies circle, probe, and attack with varied behavior.",
+            "You have 9 HP. No regen.",
+        ]
+        y = trect.bottom + 10
+        for line in inst_lines:
+            s = self.font.render(line, True, (200,200,200))
+            self.screen.blit(s, (WIDTH//2 - s.get_width()//2, y))
+            y += 24
+
+        # Play button
+        bw, bh = 220, 50
+        bx, by = WIDTH//2 - bw//2, y + 20
+        self.button_rect = pygame.Rect(bx, by, bw, bh)
+        pygame.draw.rect(self.screen, (60,120,220), self.button_rect, border_radius=8)
+        btxt = self.font.render("Play → Choose Equipment", True, WHITE)
+        self.screen.blit(btxt, (bx + bw//2 - btxt.get_width()//2, by + bh//2 - btxt.get_height()//2))
+
+        # highscore
+        hs = self.font.render(f"Highscore (kills): {self.highscore}", True, (225,225,225))
+        self.screen.blit(hs, (WIDTH//2 - hs.get_width()//2, by + bh + 30))
+
+        pygame.display.flip()
+
+    def draw_equip(self):
+        self.screen.fill((22,22,24))
+        t = self.big_font.render("Choose your equipment", True, WHITE)
+        self.screen.blit(t, (WIDTH//2 - t.get_width()//2, 60))
+
+        sub = self.font.render("Left hand: A/D or ←/→ to change   |   Right hand: Q/E to change   |   Enter/Space to start", True, (200,200,200))
+        self.screen.blit(sub, (WIDTH//2 - sub.get_width()//2, 110))
+
+        # Left hand card
+        left_cls = self.equip_options[self.equip_left_idx]
+        right_cls = self.equip_options[self.equip_right_idx]
+        # enforce rule visually: never two shields
+        if left_cls == Shield and right_cls == Shield:
+            right_cls = Sword
+
+        lw, lh = 260, 150
+        rx = WIDTH//2 + 40
+        lx = WIDTH//2 - 40 - lw
+        y = 200
+        lr = pygame.Rect(lx, y, lw, lh)
+        rr = pygame.Rect(rx, y, lw, lh)
+        pygame.draw.rect(self.screen, (40,40,60), lr, border_radius=10)
+        pygame.draw.rect(self.screen, (40,40,60), rr, border_radius=10)
+
+        lt = self.font.render(f"Left: {left_cls.__name__}", True, WHITE)
+        rt = self.font.render(f"Right: {right_cls.__name__}", True, WHITE)
+        self.screen.blit(lt, (lr.centerx - lt.get_width()//2, lr.top + 14))
+        self.screen.blit(rt, (rr.centerx - rt.get_width()//2, rr.top + 14))
+
+        # tiny previews
+        self.preview_item(self.screen, lr.center, left_cls)
+        self.preview_item(self.screen, rr.center, right_cls)
+
+        # Play
+        bw, bh = 180, 48
+        bx, by = WIDTH//2 - bw//2, y + lh + 60
+        self.play_rect = pygame.Rect(bx, by, bw, bh)
+        pygame.draw.rect(self.screen, (60,180,90), self.play_rect, border_radius=10)
+        ptxt = self.font.render("Start", True, WHITE)
+        self.screen.blit(ptxt, (bx + bw//2 - ptxt.get_width()//2, by + bh//2 - ptxt.get_height()//2))
+
+        pygame.display.flip()
+
+    def preview_item(self, surf, center, cls):
+        # simple icon
+        if cls == Sword:
+            pygame.draw.rect(surf, (160,160,160), pygame.Rect(center[0]-40, center[1]-6, 80, 12), border_radius=4)
+        elif cls == Dagger:
+            pygame.draw.rect(surf, (160,160,160), pygame.Rect(center[0]-26, center[1]-5, 52, 10), border_radius=4)
+        elif cls == Shield:
+            pygame.draw.rect(surf, (150,150,150), pygame.Rect(center[0]-12, center[1]-24, 24, 48), border_radius=6)
+        else:
+            pygame.draw.rect(surf, YELLOW, pygame.Rect(center[0]-18, center[1]-18, 36, 36), border_radius=8)
+
+    def draw_gameover(self):
+        self.screen.fill((12,12,14))
+        t = self.big_font.render("You Died", True, (230,60,60))
+        self.screen.blit(t, (WIDTH//2 - t.get_width()//2, 140))
+        k = self.font.render(f"Kills: {self.player.kills if self.player else 0}", True, WHITE)
+        hs = self.font.render(f"Highscore: {self.highscore}", True, WHITE)
+        self.screen.blit(k, (WIDTH//2 - k.get_width()//2, 220))
+        self.screen.blit(hs, (WIDTH//2 - hs.get_width()//2, 250))
+        p = self.font.render("Press any key to return to menu", True, (200,200,200))
+        self.screen.blit(p, (WIDTH//2 - p.get_width()//2, 320))
+        pygame.display.flip()
+
+# -------------------------
+# Boot
+# -------------------------
+if __name__ == "__main__":
+    Game().run()
